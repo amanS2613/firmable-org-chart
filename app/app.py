@@ -547,151 +547,126 @@ with overview_tab:
 # ============================================================
 
 with chart_tab:
-    st.subheader("Organization Structure")
+    st.subheader("Complete Organization Structure")
 
     st.write(
-        "View one reporting tree at a time. The most senior/root employee "
-        "appears at the top, followed by managers, team leads, and employees."
+        "The full company hierarchy is shown below. Each disconnected "
+        "reporting component is rendered as its own vertical chart so that "
+        "all employees remain visible without compressing the company into "
+        "one extremely wide image."
     )
 
-    # A company can contain multiple disconnected components because the
-    # inference process deliberately abstains when a manager is uncertain.
-    # Rendering all components in one Graphviz image makes the chart too wide
-    # to read, so let the user select one component at a time.
-    component_source = company_employees.copy()
-    component_source["employee_id"] = component_source["employee_id"].astype("string").str.strip()
-    component_source["root_employee_id"] = component_source["root_employee_id"].astype("string").str.strip()
-
-    root_ids = (
-        component_source["root_employee_id"]
-        .dropna()
-        .loc[lambda values: values.ne("")]
-        .drop_duplicates()
+    departments = sorted(
+        company_employees["department"]
+        .fillna("Unknown")
         .astype(str)
+        .unique()
         .tolist()
     )
 
-    if not root_ids:
-        root_ids = (
-            component_source.loc[
-                component_source["manager_id"].isna(), "employee_id"
-            ]
-            .dropna()
-            .astype(str)
-            .tolist()
-        )
-
-    root_lookup = (
-        component_source.set_index("employee_id")
-        .to_dict(orient="index")
+    selected_department = st.selectbox(
+        "Department filter",
+        ["All Departments"] + departments,
+        index=0,
+        help=(
+            "A department view includes employees in that department and "
+            "their manager ancestors up to the root of each reporting tree."
+        ),
+        key=f"department_filter_{selected_company_id}",
     )
+
+    chart_data = get_department_view(company_employees, selected_department)
+
+    # Use the published root identifier to split the company into connected
+    # components. This is a display-only split; no reporting links are added.
+    chart_data = chart_data.copy()
+    chart_data["employee_id"] = chart_data["employee_id"].astype("string").str.strip()
+    chart_data["root_employee_id"] = chart_data["root_employee_id"].astype("string").str.strip()
+
+    missing_root = chart_data["root_employee_id"].isna() | chart_data["root_employee_id"].eq("")
+    if missing_root.any():
+        chart_data.loc[missing_root, "root_employee_id"] = chart_data.loc[
+            missing_root, "employee_id"
+        ]
 
     component_sizes = (
-        component_source.groupby("root_employee_id", dropna=True)
+        chart_data.groupby("root_employee_id", dropna=False)
         .size()
-        .to_dict()
+        .sort_values(ascending=False)
     )
 
-    def component_label(root_id):
-        root = root_lookup.get(str(root_id), {})
-        title = safe_text(root.get("job_title_clean"), "Root employee")
-        root_type = safe_text(root.get("root_type"), "Disconnected component")
-        size = component_sizes.get(root_id, 0)
-        return f"{title} | {root_id} | {root_type} | {size:,} employees"
+    total_roots = len(component_sizes)
+    total_without_manager = int(chart_data["manager_id"].isna().sum())
+    max_depth = pd.to_numeric(
+        chart_data["hierarchy_depth"], errors="coerce"
+    ).max()
+    max_depth = int(max_depth) if pd.notna(max_depth) else 0
 
-    if not root_ids:
-        st.warning("No hierarchy roots were found for this company.")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Employees in view", f"{len(chart_data):,}")
+    m2.metric("Reporting components", f"{total_roots:,}")
+    m3.metric("Maximum hierarchy level", max_depth)
+
+    st.markdown(
+        """
+        <div class="chart-note">
+            Blue = CEO/root &nbsp; · &nbsp;
+            Amber = other disconnected root &nbsp; · &nbsp;
+            Light blue = senior leadership &nbsp; · &nbsp;
+            Green = team members / individual contributors
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if chart_data.empty:
+        st.warning("No employees are available for this chart selection.")
     else:
-        selected_root_id = st.selectbox(
-            "Select a reporting tree",
-            root_ids,
-            format_func=component_label,
-            help=(
-                "Each option is a separate connected hierarchy. Select the "
-                "CEO root to view the main company tree, or another root to "
-                "inspect a disconnected component."
-            ),
-            key=f"component_filter_{selected_company_id}",
+        st.caption(
+            "All employees in the selected view are included. Separate roots "
+            "are displayed as separate trees; no artificial manager links "
+            "are created."
         )
 
-        component_df = component_source[
-            component_source["root_employee_id"].astype("string").eq(selected_root_id)
-        ].copy()
-
-        # Fallback for datasets where root_employee_id is unavailable on rows.
-        if component_df.empty:
-            component_df = component_source[
-                component_source["employee_id"].astype(str).eq(selected_root_id)
+        for component_number, (root_id, component_size) in enumerate(
+            component_sizes.items(), start=1
+        ):
+            component_df = chart_data[
+                chart_data["root_employee_id"].astype(str) == str(root_id)
             ].copy()
 
-        departments = sorted(
-            component_df["department"]
-            .fillna("Unknown")
-            .astype(str)
-            .unique()
-            .tolist()
-        )
+            root_rows = component_df[
+                component_df["employee_id"].astype(str) == str(root_id)
+            ]
+            if root_rows.empty:
+                root_rows = component_df[component_df["manager_id"].isna()]
 
-        selected_department = st.selectbox(
-            "Department filter",
-            ["All Departments"] + departments,
-            index=0,
-            help=(
-                "A department view retains the selected department's manager "
-                "ancestors so its reporting path remains visible."
-            ),
-            key=f"department_filter_{selected_company_id}_{selected_root_id}",
-        )
+            if not root_rows.empty:
+                root_record = root_rows.iloc[0]
+                root_title = safe_text(
+                    root_record.get("job_title_clean"), "Root employee"
+                )
+                root_type = safe_text(
+                    root_record.get("root_type"), "Disconnected component"
+                )
+            else:
+                root_title = "Reporting component"
+                root_type = "Disconnected component"
 
-        chart_data = get_department_view(component_df, selected_department)
-
-        root_record = root_lookup.get(str(selected_root_id), {})
-        root_title = safe_text(root_record.get("job_title_clean"), "Root employee")
-        st.markdown(f"**Top of this hierarchy:** {root_title} (`{selected_root_id}`)")
-
-        root_count = int(chart_data["manager_id"].isna().sum())
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Employees in view", f"{len(chart_data):,}")
-        c2.metric("Employees without manager", f"{root_count:,}")
-        c3.metric(
-            "Maximum level",
-            int(pd.to_numeric(chart_data["hierarchy_depth"], errors="coerce").max())
-            if chart_data["hierarchy_depth"].notna().any()
-            else 0,
-        )
-
-        st.markdown(
-            """
-            <div class="chart-note">
-                Blue = CEO/root &nbsp; · &nbsp;
-                Amber = other disconnected root &nbsp; · &nbsp;
-                Light blue = senior leadership &nbsp; · &nbsp;
-                Green = team members / individual contributors
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        chart = build_org_chart(
-            chart_data,
-            show_department=(selected_department == "All Departments"),
-        )
-
-        if chart is not None:
-            st.graphviz_chart(chart, use_container_width=True)
-
-        if selected_department == "All Departments":
-            st.caption(
-                "Showing the complete selected reporting tree. Choose another "
-                "tree from the selector to inspect other disconnected components."
+            st.markdown(
+                f"#### {component_number}. {root_title} "
+                f"· {root_id} · {int(component_size):,} employees"
             )
-        else:
-            st.caption(
-                f"Showing {selected_department} employees plus the managers "
-                "required to connect them to this tree's root."
-            )
+            st.caption(root_type)
 
-        with st.expander("View employees included in this chart"):
+            chart = build_org_chart(
+                component_df,
+                show_department=(selected_department == "All Departments"),
+            )
+            if chart is not None:
+                st.graphviz_chart(chart, use_container_width=True)
+
+        with st.expander("View all employees included in this chart"):
             chart_columns = [
                 column
                 for column in [
@@ -701,6 +676,7 @@ with chart_tab:
                     "manager_id",
                     "inferred_seniority_level",
                     "hierarchy_depth",
+                    "root_employee_id",
                     "root_type",
                     "assignment_status",
                 ]
@@ -709,7 +685,7 @@ with chart_tab:
 
             st.dataframe(
                 chart_data[chart_columns].sort_values(
-                    ["hierarchy_depth", "department", "job_title_clean"],
+                    ["root_employee_id", "hierarchy_depth", "department", "job_title_clean"],
                     na_position="last",
                 ),
                 use_container_width=True,
