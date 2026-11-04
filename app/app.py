@@ -1,6 +1,4 @@
 from pathlib import Path
-
-code = r'''from pathlib import Path
 from collections import defaultdict
 
 import streamlit as st
@@ -825,6 +823,3 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-'''
-
-
